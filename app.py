@@ -6,11 +6,91 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import streamlit as st
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+# Ưu tiên import từ thư mục src/ nếu có; nếu deploy thiếu src/ thì dùng hàm tích hợp bên dưới
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
-from preprocessing import clean_and_prepare_data, aggregate_sales
-from features import FEATURE_COLS, create_supervised_dataset
-from forecaster import recursive_forecast
+
+try:
+    from preprocessing import clean_and_prepare_data, aggregate_sales
+except ModuleNotFoundError:
+    def clean_and_prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.drop_duplicates().dropna(subset=["Order Date", "Sales"]).copy()
+        df["Order Date"] = pd.to_datetime(df["Order Date"], format="mixed", dayfirst=True)
+        df = df.sort_values("Order Date").reset_index(drop=True)
+        df["Sales"] = pd.to_numeric(df["Sales"], errors="coerce")
+        df = df[df["Sales"] > 0].copy()
+        df["Year"] = df["Order Date"].dt.year
+        df["Month"] = df["Order Date"].dt.month
+        df["Quarter"] = df["Order Date"].dt.quarter
+        df["DayOfWeek"] = df["Order Date"].dt.dayofweek
+        df["YearMonth"] = df["Order Date"].dt.to_period("M").astype(str)
+        return df
+
+    def aggregate_sales(df: pd.DataFrame):
+        daily = df.groupby("Order Date")["Sales"].sum().reset_index()
+        full_range = pd.date_range(start=daily["Order Date"].min(), end=daily["Order Date"].max(), freq="D")
+        daily = daily.set_index("Order Date").reindex(full_range, fill_value=0).reset_index()
+        daily.columns = ["Order Date", "Sales"]
+        monthly = df.groupby("YearMonth")["Sales"].sum().reset_index()
+        return daily, monthly
+
+try:
+    from features import FEATURE_COLS, build_single_step_features, create_supervised_dataset
+except ModuleNotFoundError:
+    FEATURE_COLS = [
+        "time_index", "month", "quarter", "month_sin", "month_cos",
+        "lag_1", "lag_2", "lag_3", "lag_12", "rolling_mean_3",
+    ]
+
+    def build_single_step_features(sales_history: list, period_obj: pd.Period, time_idx: int) -> dict:
+        if len(sales_history) < 12:
+            raise ValueError("Cần tối thiểu 12 tháng dữ liệu lịch sử.")
+        month = period_obj.month
+        return {
+            "time_index": time_idx,
+            "month": month,
+            "quarter": period_obj.quarter,
+            "month_sin": np.sin(2 * np.pi * month / 12.0),
+            "month_cos": np.cos(2 * np.pi * month / 12.0),
+            "lag_1": float(sales_history[-1]),
+            "lag_2": float(sales_history[-2]),
+            "lag_3": float(sales_history[-3]),
+            "lag_12": float(sales_history[-12]),
+            "rolling_mean_3": float(np.mean(sales_history[-3:])),
+        }
+
+    def create_supervised_dataset(monthly_df: pd.DataFrame) -> pd.DataFrame:
+        df = monthly_df.sort_values("YearMonth").reset_index(drop=True)
+        periods = pd.PeriodIndex(df["YearMonth"], freq="M")
+        sales_values = df["Sales"].tolist()
+        rows = []
+        for i in range(12, len(df)):
+            feat = build_single_step_features(sales_values[:i], periods[i], time_idx=i)
+            feat["YearMonth"] = str(periods[i])
+            feat["Sales"] = float(sales_values[i])
+            rows.append(feat)
+        return pd.DataFrame(rows)
+
+try:
+    from forecaster import recursive_forecast
+except ModuleNotFoundError:
+    def recursive_forecast(model, full_monthly_df: pd.DataFrame, steps: int) -> pd.DataFrame:
+        df = full_monthly_df.sort_values("YearMonth").reset_index(drop=True)
+        sales_history = df["Sales"].tolist()
+        last_period = pd.Period(df["YearMonth"].iloc[-1], freq="M")
+        start_idx = len(df)
+        future_rows = []
+        for step in range(1, steps + 1):
+            next_period = last_period + step
+            feat_dict = build_single_step_features(sales_history, next_period, time_idx=start_idx + step - 1)
+            X_next = pd.DataFrame([feat_dict])[FEATURE_COLS]
+            pred_sales = max(0.0, float(model.predict(X_next)[0]))
+            sales_history.append(pred_sales)
+            future_rows.append({"YearMonth": str(next_period), "Predicted_Sales": pred_sales})
+        return pd.DataFrame(future_rows)
 
 # ==================== CẤU HÌNH TRANG ====================
 st.set_page_config(
@@ -33,7 +113,6 @@ ROSE = "#F43F5E"
 
 
 def is_dark_theme() -> bool:
-    """Nhận diện tự động chế độ Sáng / Tối hiện tại của Streamlit."""
     try:
         theme_type = getattr(getattr(st.context, "theme", None), "type", None)
         return str(theme_type).lower() == "dark"
@@ -50,8 +129,6 @@ st.markdown(
     padding-bottom: 2.5rem;
     max-width: 1380px;
 }
-
-/* Thẻ thương hiệu Navy-Indigo ở đầu Sidebar giống ảnh mẫu */
 .brand-header {
     display: flex;
     align-items: center;
@@ -88,8 +165,6 @@ st.markdown(
     color: #CBD5E1;
     margin-top: 2px;
 }
-
-/* Tiêu đề trang (tự đổi màu theo theme) */
 .page-title {
     font-size: 24px;
     font-weight: 800;
@@ -103,8 +178,6 @@ st.markdown(
     opacity: 0.72;
     margin: 3px 0 0 0;
 }
-
-/* Thanh Tabs hiện đại với Material Icons */
 .stTabs [data-baseweb="tab-list"] {
     gap: 6px;
     background-color: var(--secondary-background-color);
@@ -135,8 +208,6 @@ st.markdown(
 .stTabs [data-baseweb="tab-highlight"] {
     display: none !important;
 }
-
-/* Thẻ KPI có Sparkline */
 .saas-kpi-card {
     background-color: var(--secondary-background-color);
     border: 1px solid rgba(128, 128, 128, 0.22);
@@ -208,8 +279,6 @@ st.markdown(
     opacity: 0.62;
     margin-left: 5px;
 }
-
-/* Tiêu đề từng thẻ biểu đồ */
 .card-title {
     font-size: 15.5px;
     font-weight: 700;
@@ -222,8 +291,6 @@ st.markdown(
     opacity: 0.68;
     margin-bottom: 10px;
 }
-
-/* Nút bấm chính màu tím Indigo */
 .stDownloadButton button {
     background-color: #635BFF !important;
     color: #FFFFFF !important;
@@ -235,8 +302,6 @@ st.markdown(
 .stDownloadButton button:hover {
     background-color: #4F46E5 !important;
 }
-
-/* Thanh tiến độ (Hiệu suất khu vực) */
 .prog-row {
     margin-bottom: 15px;
 }
@@ -272,8 +337,6 @@ st.markdown(
     height: 100%;
     border-radius: 999px;
 }
-
-/* Danh sách Top nguồn doanh thu */
 .source-row {
     display: flex;
     align-items: center;
@@ -337,11 +400,7 @@ def make_sparkline_svg(values: list, stroke_color: str) -> str:
         values = [10, 14, 12, 18, 16, 22, 25]
     arr = np.array(values, dtype=float)
     min_v, max_v = arr.min(), arr.max()
-    if max_v - min_v < 1e-9:
-        norm = np.full_like(arr, 0.5)
-    else:
-        norm = (arr - min_v) / (max_v - min_v)
-
+    norm = np.full_like(arr, 0.5) if (max_v - min_v < 1e-9) else (arr - min_v) / (max_v - min_v)
     w, h = 76, 26
     xs = np.linspace(2, w - 2, len(norm))
     ys = (h - 4) - norm * (h - 8) + 2
@@ -392,28 +451,101 @@ def smooth_series(y_vals: np.ndarray, points_per_seg: int = 12):
             + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
             + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
         )
-        x_seg = i + t
-        x_smooth.append(x_seg)
+        x_smooth.append(i + t)
         y_smooth.append(y_seg)
     return np.concatenate(x_smooth), np.concatenate(y_smooth)
 
 
 @st.cache_data
 def load_default_data():
-    raw_path = os.path.join("data", "raw", "superstore.csv")
-    try:
-        df = pd.read_csv(raw_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(raw_path, encoding="latin1")
-    return df
+    candidate_paths = [
+        os.path.join("data", "raw", "superstore.csv"),
+        "superstore.csv",
+    ]
+    for p in candidate_paths:
+        if os.path.exists(p):
+            try:
+                return pd.read_csv(p, encoding="utf-8")
+            except UnicodeDecodeError:
+                return pd.read_csv(p, encoding="latin1")
+
+    # Dữ liệu dự phòng 48 tháng nếu file superstore.csv chưa được đẩy lên GitHub
+    rng = np.random.default_rng(42)
+    catalog = [
+        ("Technology", "Phones", "Samsung Galaxy S24 Ultra 256GB"),
+        ("Technology", "Machines", "Canon imageCLASS MF455dw Laser Printer"),
+        ("Technology", "Accessories", "Logitech MX Master 3S Wireless Mouse"),
+        ("Furniture", "Chairs", "Herman Miller Aeron Ergonomic Chair"),
+        ("Furniture", "Tables", "Bretford Rectangular Conference Table"),
+        ("Office Supplies", "Binders", "Fellowes PB500 Electric Binding Machine"),
+        ("Office Supplies", "Paper", "Xerox Business 4200 Multipurpose Paper"),
+    ]
+    regions = ["West", "East", "Central", "South"]
+    rows = []
+    oid = 1000
+    for y_idx, yr in enumerate([2015, 2016, 2017, 2018]):
+        growth = 1.0 + 0.14 * y_idx
+        for m in range(1, 13):
+            season = 1.65 if m in [11, 12] else (1.35 if m in [9, 10] else (0.75 if m in [1, 2] else 1.0))
+            for k in range(12):
+                day = int(rng.integers(1, 28))
+                cat, sub, prod = catalog[(m + k) % len(catalog)]
+                reg = regions[(yr + m + k) % len(regions)]
+                qty = int(rng.integers(1, 9))
+                base = {"Technology": 680, "Furniture": 520, "Office Supplies": 240}[cat]
+                sales = round(float(base * qty * season * growth * rng.uniform(0.7, 1.3)), 2)
+                oid += 1
+                rows.append([f"CA-{yr}-{oid}", f"{day:02d}/{m:02d}/{yr}", cat, sub, prod, reg, qty, sales])
+    return pd.DataFrame(rows, columns=["Order ID", "Order Date", "Category", "Sub-Category", "Product Name", "Region", "Quantity", "Sales"])
 
 
 @st.cache_resource
-def load_saved_model():
-    model_path = os.path.join("models", "best_model.joblib")
-    if os.path.exists(model_path):
-        return joblib.load(model_path)
-    return None
+def load_saved_model(monthly_df: pd.DataFrame):
+    for p in [os.path.join("models", "best_model.joblib"), "best_model.joblib"]:
+        if os.path.exists(p):
+            return joblib.load(p)
+
+    # Tự động huấn luyện nếu chưa có file best_model.joblib trên server
+    sup_df = create_supervised_dataset(monthly_df)
+    test_size = min(12, max(3, len(sup_df) // 3))
+    train_df = sup_df.iloc[:-test_size].copy()
+    test_df = sup_df.iloc[-test_size:].copy()
+    X_train, y_train = train_df[FEATURE_COLS], train_df["Sales"].values
+    y_test = test_df["Sales"].values
+
+    def calc_m(yt, yp):
+        return {
+            "MAE": float(mean_absolute_error(yt, yp)),
+            "RMSE": float(np.sqrt(mean_squared_error(yt, yp))),
+            "MAPE (%)": float(np.mean(np.abs((yt - yp) / np.maximum(yt, 1e-8))) * 100.0),
+        }
+
+    results = []
+    base_m = calc_m(y_test, test_df["lag_12"].values)
+    base_m["Mô hình"] = "Baseline (Cùng kỳ năm trước)"
+    results.append(base_m)
+
+    candidates = {
+        "Linear Regression": LinearRegression(),
+        "Random Forest": RandomForestRegressor(n_estimators=200, max_depth=6, random_state=42),
+        "Gradient Boosting": GradientBoostingRegressor(n_estimators=150, learning_rate=0.08, max_depth=3, random_state=42),
+    }
+    trained = {}
+    hist_train = monthly_df.iloc[:-test_size].copy()
+    for name, m in candidates.items():
+        m.fit(X_train, y_train)
+        pred_df = recursive_forecast(m, hist_train, steps=test_size)
+        met = calc_m(y_test, pred_df["Predicted_Sales"].values)
+        met["Mô hình"] = name
+        results.append(met)
+        trained[name] = m
+
+    res_df = pd.DataFrame(results)[["Mô hình", "MAE", "RMSE", "MAPE (%)"]].sort_values("MAPE (%)")
+    ml_only = res_df[res_df["Mô hình"] != "Baseline (Cùng kỳ năm trước)"]
+    best_name = ml_only.iloc[0]["Mô hình"]
+    best_m = trained[best_name]
+    best_m.fit(sup_df[FEATURE_COLS], sup_df["Sales"].values)
+    return {"model": best_m, "model_name": best_name, "metrics_table": res_df, "feature_cols": FEATURE_COLS}
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
@@ -557,7 +689,6 @@ else:
     prev_y = sel_y - 1 if (sel_y - 1) in years_avail else sel_y
     compare_label = f"so với năm {prev_y}"
 
-# Bảng màu biểu đồ động theo chế độ Sáng / Tối
 dark_mode = is_dark_theme()
 chart_text_color = "#F1F5F9" if dark_mode else "#0F172A"
 chart_muted_color = "#94A3B8" if dark_mode else "#64748B"
@@ -612,58 +743,16 @@ with tab_dash:
     ).reset_index()
     m_grp["aov"] = m_grp["sales"] / np.maximum(m_grp["orders"], 1)
 
-    # ---------- HÀNG 1: 4 THẺ KPI SPARKLINE ----------
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        render_saas_kpi(
-            "Tổng Doanh thu",
-            f"${tot_rev:,.0f}",
-            rev_growth,
-            compare_label,
-            "💳",
-            "rgba(99, 91, 255, 0.16)",
-            m_grp["sales"].tail(10).tolist(),
-            INDIGO,
-            rev_pos,
-        )
+        render_saas_kpi("Tổng Doanh thu", f"${tot_rev:,.0f}", rev_growth, compare_label, "💳", "rgba(99, 91, 255, 0.16)", m_grp["sales"].tail(10).tolist(), INDIGO, rev_pos)
     with k2:
-        render_saas_kpi(
-            "Đơn hàng hoàn tất",
-            f"{tot_orders:,}",
-            ord_growth,
-            compare_label,
-            "🧾",
-            "rgba(20, 184, 166, 0.16)",
-            m_grp["orders"].tail(10).tolist(),
-            TEAL,
-            ord_pos,
-        )
+        render_saas_kpi("Đơn hàng hoàn tất", f"{tot_orders:,}", ord_growth, compare_label, "🧾", "rgba(20, 184, 166, 0.16)", m_grp["orders"].tail(10).tolist(), TEAL, ord_pos)
     with k3:
-        render_saas_kpi(
-            "Sản lượng bán ra",
-            f"{tot_qty:,}",
-            qty_growth,
-            compare_label,
-            "📦",
-            "rgba(245, 158, 11, 0.16)",
-            m_grp["qty"].tail(10).tolist(),
-            AMBER,
-            qty_pos,
-        )
+        render_saas_kpi("Sản lượng bán ra", f"{tot_qty:,}", qty_growth, compare_label, "📦", "rgba(245, 158, 11, 0.16)", m_grp["qty"].tail(10).tolist(), AMBER, qty_pos)
     with k4:
-        render_saas_kpi(
-            "Giá trị TB / Đơn",
-            f"${aov:,.2f}",
-            aov_growth,
-            compare_label,
-            "📈",
-            "rgba(16, 185, 129, 0.16)",
-            m_grp["aov"].tail(10).tolist(),
-            "#10B981",
-            aov_pos,
-        )
+        render_saas_kpi("Giá trị TB / Đơn", f"${aov:,.2f}", aov_growth, compare_label, "📈", "rgba(16, 185, 129, 0.16)", m_grp["aov"].tail(10).tolist(), "#10B981", aov_pos)
 
-    # ---------- HÀNG 2: REVENUE TREND (TRÁI) + DONUT CHART (PHẢI) ----------
     col_trend, col_donut = st.columns([1.68, 1])
 
     with col_trend:
@@ -773,7 +862,6 @@ with tab_dash:
                     unsafe_allow_html=True,
                 )
 
-    # ---------- HÀNG 3: 3 THẺ PHÂN TÍCH CHI TIẾT ----------
     b1, b2, b3 = st.columns([1, 1.15, 1.15])
 
     with b1:
@@ -876,15 +964,11 @@ with tab_dash:
 # TAB 2: DỰ ĐOÁN DOANH THU TƯƠNG LAI
 # ==============================================================================
 with tab_forecast:
-    artifact = load_saved_model()
-    if artifact is None:
-        st.error("❌ Chưa tìm thấy file mô hình `models/best_model.joblib`. Vui lòng chạy `python src/forecaster.py` trước.")
-        st.stop()
-
     if len(monthly_sales) < 12:
         st.error(f"❌ Dữ liệu hiện tại chỉ có {len(monthly_sales)} tháng. Mô hình cần tối thiểu 12 tháng lịch sử.")
         st.stop()
 
+    artifact = load_saved_model(monthly_sales)
     model = artifact["model"]
     model_name = artifact["model_name"]
     metrics_table = artifact["metrics_table"]
@@ -924,30 +1008,13 @@ with tab_forecast:
         fig_fc.patch.set_alpha(0.0)
         ax_fc.patch.set_alpha(0.0)
 
-        ax_fc.plot(
-            hist_recent["YearMonth"],
-            hist_recent["Sales"],
-            marker="o",
-            markersize=5,
-            linewidth=2.4,
-            color=INDIGO,
-            label="Doanh thu Lịch sử",
-        )
+        ax_fc.plot(hist_recent["YearMonth"], hist_recent["Sales"], marker="o", markersize=5, linewidth=2.4, color=INDIGO, label="Doanh thu Lịch sử")
         ax_fc.fill_between(hist_recent["YearMonth"], hist_recent["Sales"], color=INDIGO, alpha=0.10)
 
         bridge_x = [hist_recent["YearMonth"].iloc[-1]] + forecast_df["YearMonth"].tolist()
         bridge_y = np.array([hist_recent["Sales"].iloc[-1]] + forecast_df["Predicted_Sales"].tolist())
 
-        ax_fc.plot(
-            bridge_x,
-            bridge_y,
-            marker="s",
-            markersize=6,
-            linestyle="--",
-            linewidth=2.4,
-            color=ROSE,
-            label=f"Dự báo {forecast_months} tháng tới ({model_name})",
-        )
+        ax_fc.plot(bridge_x, bridge_y, marker="s", markersize=6, linestyle="--", linewidth=2.4, color=ROSE, label=f"Dự báo {forecast_months} tháng tới ({model_name})")
 
         if model_mae > 0:
             lower_b = np.maximum(0, bridge_y - model_mae)
